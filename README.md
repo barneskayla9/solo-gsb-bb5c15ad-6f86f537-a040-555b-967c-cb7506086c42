@@ -1,7 +1,8 @@
 # 社区回收点服务日历 HTTP API
 
 为社区回收点维护**每周开放时段**、**指定日期全天停开**与**当日补开时段**，
-按当地日期范围查询，逐日返回**实际开放区间的 UTC 起止、当地日期和来源**。
+按当地日期范围查询，逐日返回**实际开放区间的 UTC 起止、当地日期和来源**；
+并以**当前已发布日历**为准提供**到访预约**与取消。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -45,6 +46,8 @@ docker compose up --build
 | `POSTGRES_PORT_PUBLISH` | `5432` | 映射到宿主机的数据库端口 |
 | `APP_PORT_PUBLISH` | `8000` | 映射到宿主机的 API 端口 |
 | `MAX_QUERY_DAYS` | `370` | 日历查询允许的最大跨天数量（两端包含） |
+| `BOOKING_MAX_LEAD_DAYS` | `30` | 预约起点距当前允许的最大未来天数 |
+| `BOOKING_MAX_DURATION_HOURS` | `2` | 单次预约允许的最长时长（小时） |
 | `DATABASE_URL` | （无，由上面拼装） | 完整 libpq 连接串，**非容器/本地运行时**可直接设置，例如 `postgresql://recycle:recycle@localhost:5432/recycle` |
 
 容器内 API 固定监听 `0.0.0.0:8000`；容器内数据库主机固定为 `db:5432`。
@@ -90,6 +93,29 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 每次日历查询在 `REPEATABLE READ` 事务里读取**同一个已发布版本**的完整规则；
     也可用 `?version=N` 显式固定到某个历史已发布版本。
   - 新建回收点版本号为 `0`，表示“尚无已发布规则”。
+
+### 预约语义
+
+- 预约以**请求时刻的当前已发布日历**为准，并记录命中的**规则版本**；
+  没有已发布规则的回收点不能预约。
+- 请求给出**回收点、UTC 起止时刻与客户幂等键**：
+  - 起点必须严格晚于当前时刻，且在未来 `BOOKING_MAX_LEAD_DAYS`（默认 30）天内；
+  - 终点严格晚于起点，时长不超过 `BOOKING_MAX_DURATION_HOURS`（默认 2）小时；
+  - 时间戳必须带显式时区偏移（如 `Z`、`+08:00`），服务端统一归一化到 UTC。
+- 预约区间必须**完整落在一个连续开放时段内**；跨当地午夜的场次在午夜两侧是
+  首尾相接的两段，合并后视为同一连续时段，因此**允许预约跨当地午夜**。
+- 与同一点**未取消**预约按半开区间 `[start, end)` 比较：真正的 UTC 重叠拒绝，
+  **首尾相接（一端结束恰为另一端开始）可以并存**；不同回收点互不影响。
+- **幂等**：同一回收点 + 同一幂等键以**首次请求**为准；同内容重试返回原结果
+  （含原预约号与取消凭证；若已取消则返回已取消状态），异内容重试返回 409。
+- **取消**：凭预约号与取消凭证取消；重复取消幂等返回“已取消”。无凭证报 422，
+  凭证错误报 403。取消后该时间段立即释放，可被新预约占用。
+- **变更保护**：发布规则或修改时区若会使任一**尚未开始的未取消预约**在新日历
+  下不再完整开放，则拒绝变更并在 `details.conflicting_appointments` 返回冲突
+  预约号；已开始/已过去的预约不阻挡变更。
+- **并发**：预约、发布、改时区在回收点行锁上串行，并由 `calendar_epoch` 纪元
+  二次校验（日历在读取与加锁之间变化则预约事务回滚并重试）；数据库内还有
+  无扩展的重叠触发器兜底，保证任何并发交错下不变量都成立。
 
 ---
 
@@ -183,17 +209,61 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 无开放时段的日期仍然出现，`intervals` 为空数组。`sources[].kind` 为
 `weekly`（带 `weekday`）或 `makeup`（带 `day`）。
 
-### 4.4 可区分错误码
+### 4.4 到访预约
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/points/{id}/appointments` | 以当前已发布日历预约到访（201） |
+| `POST` | `/points/{id}/appointments/{appointment_id}/cancel` | 凭凭证取消（重复取消幂等） |
+
+预约请求体（时间为带偏移的 UTC ISO 8601）：
+
+```json
+{
+  "start_at": "2026-10-02T12:00:00Z",
+  "end_at": "2026-10-02T12:30:00Z",
+  "idempotency_key": "customer-uuid-0001"
+}
+```
+
+成功响应（`appointment_id` 即预约号，`cancel_token` 仅在此响应中给出，请妥善保存）：
+
+```json
+{
+  "id": 7,
+  "point_id": 1,
+  "start_at": "2026-10-02T12:00:00Z",
+  "end_at": "2026-10-02T12:30:00Z",
+  "idempotency_key": "customer-uuid-0001",
+  "cancel_token": "m9b…随机URL安全串…",
+  "status": "booked",
+  "rules_version": 1,
+  "created_at": "2026-09-30T08:00:00Z",
+  "cancelled_at": null
+}
+```
+
+取消请求体：`{"cancel_token": "m9b…"}`，返回同一对象，`status` 变为
+`cancelled` 且带 `cancelled_at`。幂等重试（同键同内容）返回原结果。
+
+### 4.5 可区分错误码
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
 | 404 | `point_not_found` | 回收点不存在 |
+| 404 | `appointment_not_found` | 预约号不存在（或不属于该回收点） |
 | 404 | `version_not_found` | 指定的已发布版本不存在 |
-| 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历 |
+| 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或预约 |
 | 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号） |
-| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限 |
+| 409 | `idempotency_conflict` | 同一点同一幂等键被用于不同的请求内容 |
+| 409 | `appointment_conflict` | 与同点未取消预约存在 UTC 时间重叠（首尾相接不算） |
+| 409 | `appointment_rule_conflict` | 发布规则/改时区会让未来未取消预约不再完整开放（`details.conflicting_appointments` 给出冲突预约号） |
+| 409 | `calendar_changed` | 预约事务期间日历被并发发布/改时区；接口会自动重试，正常不会对客户端出现 |
+| 403 | `invalid_cancel_token` | 取消凭证与预约不匹配 |
+| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、日期范围倒置/超限；预约终点不晚于起点、超过 2 小时、起点不在未来或超出未来 30 天 |
+| 422 | `outside_open_hours` | 预约 UTC 区间未完整落在当前日历的一个连续开放时段内 |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
-| 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误等） |
+| 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳不带时区偏移等） |
 
 ---
 
@@ -202,7 +272,7 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 服务启动后任选其一：
 
 ```bash
-# 方式一：curl 脚本（创建点 → 发布 → 冲突 → 查询 → 错误演示）
+# 方式一：curl 脚本（创建点 → 发布 → 预约 → 幂等/重叠 → 取消 → 错误演示）
 ./examples/curl_examples.sh
 
 # 方式二：仅依赖 Python 标准库的客户端
@@ -238,6 +308,11 @@ pytest -q
 - 重叠区间合并且保留全部来源；
 - 夏令时春缺失顺延、秋重复起点取早/终点取晚（纽约、哈瓦那午夜跳变）；
 - 版本条件提交、冲突 409、历史版本固定查询、并发发布恰好一方成功；
+- 预约的时段/时长/未来窗口校验、完整开放区间判定（含跨当地午夜）、
+  首尾相接可并存而重叠冲突、取消释放时段、取消凭证缺失/错误；
+- 幂等键：同内容返回原结果（含取消后状态）、异内容 409；
+- 发布规则/改时区使未来预约失效时被拒绝并返回冲突预约号；
+- 并发预约-预约、并发预约-发布/改时区不变量（行锁 + 纪元 + 重叠触发器）；
 - 全部可区分错误码。
 
 ---
@@ -246,14 +321,15 @@ pytest -q
 
 ```
 app/
-  config.py      环境变量配置
-  schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取（行锁 + 事务）
-  scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST）
-  schemas.py     Pydantic 请求响应模型与时段语义校验
-  errors.py      可区分错误类型
-  main.py        FastAPI 路由与错误处理
-examples/        curl 与 Python 调用示例
-tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试
+  config.py       环境变量配置
+  schema.sql      PostgreSQL 建表脚本（启动时幂等执行，含预约表与重叠触发器）
+  db.py           连接池、版本化规则的原子发布、预约存储与并发/纪元校验
+  scheduler.py    纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST）
+  appointments.py 预约领域逻辑（连续开放区间合并与完整覆盖判定、变更冲突）
+  schemas.py      Pydantic 请求响应模型与时段语义校验
+  errors.py       可区分错误类型
+  main.py         FastAPI 路由与错误处理
+examples/         curl 与 Python 调用示例（含预约/取消全流程）
+tests/            引擎单测 + 真实 PostgreSQL 的 API 集成测试
 Dockerfile, docker-compose.yml
 ```

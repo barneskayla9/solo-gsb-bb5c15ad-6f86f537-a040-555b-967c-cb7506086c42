@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Request
@@ -10,11 +10,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import psycopg
 
+from . import appointments as appt_domain
 from . import db
 from .config import settings
-from .errors import ApiError
-from .errors import InvalidPeriodError
+from .errors import (
+    ApiError,
+    CalendarChangedError,
+    InvalidPeriodError,
+    NoPublishedVersionError,
+    NotFoundError,
+)
 from .schemas import (
+    AppointmentCancelIn,
+    AppointmentCreateIn,
+    AppointmentOut,
     CalendarOut,
     DayOut,
     IntervalOut,
@@ -42,10 +51,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Recycling Point Service Calendar API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Versioned weekly openings, full-day closures and same-day makeup "
-        "openings for community recycling points, expanded to UTC intervals."
+        "openings for community recycling points, expanded to UTC intervals, "
+        "plus visit appointments booked against the published calendar."
     ),
     lifespan=lifespan,
 )
@@ -67,13 +77,24 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
 async def validation_error_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    # Pydantic v2 embeds the original exception object in ``ctx.error``; that
+    # object is not JSON serializable, so stringify anything exotic.
+    def _safe(value):
+        if isinstance(value, dict):
+            return {k: _safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_safe(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
     return JSONResponse(
         status_code=422,
         content={
             "error": {
                 "code": "invalid_request",
                 "message": "request payload failed validation",
-                "details": {"errors": exc.errors()},
+                "details": {"errors": _safe(exc.errors())},
             }
         },
     )
@@ -250,3 +271,134 @@ def calendar(
             for d in days
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Visit appointments — booked against the currently published calendar
+# ---------------------------------------------------------------------------
+
+def _appointment_out(row: dict) -> AppointmentOut:
+    return AppointmentOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        start_at=utc_iso(row["start_at"]),
+        end_at=utc_iso(row["end_at"]),
+        idempotency_key=row["idempotency_key"],
+        cancel_token=row["cancel_token"],
+        status=row["status"],
+        rules_version=row["rules_version"],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+    )
+
+
+@app.post(
+    "/points/{point_id}/appointments",
+    response_model=AppointmentOut,
+    status_code=201,
+    tags=["appointments"],
+)
+def create_appointment(point_id: int, body: AppointmentCreateIn) -> AppointmentOut:
+    # Request-shape independent period rules.
+    now = datetime.now(timezone.utc)
+    max_lead = timedelta(days=settings.booking_max_lead_days)
+    max_duration = timedelta(hours=settings.booking_max_duration_hours)
+    if body.end_at <= body.start_at:
+        raise InvalidPeriodError(
+            "'end_at' must be strictly after 'start_at'",
+            details={"start_at": body.start_at.isoformat(),
+                     "end_at": body.end_at.isoformat()},
+        )
+    if body.end_at - body.start_at > max_duration:
+        raise InvalidPeriodError(
+            f"an appointment may last at most "
+            f"{settings.booking_max_duration_hours} hours",
+            details={"max_duration_hours": settings.booking_max_duration_hours},
+        )
+    if body.start_at <= now:
+        raise InvalidPeriodError(
+            "'start_at' must be in the future",
+            details={"now": utc_iso(now)},
+        )
+    if body.start_at > now + max_lead:
+        raise InvalidPeriodError(
+            f"'start_at' must be within {settings.booking_max_lead_days} days "
+            "from now",
+            details={"max_lead_days": settings.booking_max_lead_days,
+                     "now": utc_iso(now)},
+        )
+
+    # Point-row locking plus the calendar-epoch recheck and the overlap
+    # trigger make concurrent bookings, rule publications and timezone
+    # changes safe under REPEATABLE READ.  A calendar that changed between
+    # the read and the lock aborts this attempt and is transparently retried
+    # (the idempotency lookup keeps retries safe).
+    def work(cur) -> dict:
+        point = cur.execute(
+            "SELECT id, timezone, version, calendar_epoch "
+            "FROM points WHERE id = %s FOR UPDATE",
+            (point_id,),
+        ).fetchone()
+        if point is None:
+            raise NotFoundError(f"recycling point {point_id} does not exist")
+        version_row = cur.execute(
+            "SELECT version, payload FROM rule_versions "
+            "WHERE point_id = %s ORDER BY version DESC LIMIT 1",
+            (point_id,),
+        ).fetchone()
+        if version_row is None:
+            raise NoPublishedVersionError(
+                f"point {point_id} has no published rule set yet",
+                details={"point_id": point_id, "current_version": point["version"]},
+            )
+
+        ruleset = payload_to_ruleset(version_row["payload"])
+        intervals = appt_domain.merged_open_intervals(
+            point["timezone"], ruleset, body.start_at, body.end_at
+        )
+        return db.create_appointment(
+            cur,
+            point_id,
+            body.start_at,
+            body.end_at,
+            body.idempotency_key,
+            version_row["version"],
+            point["calendar_epoch"],
+            intervals,
+        )
+
+    with db.conn() as connection:
+        previous_level = connection.isolation_level
+        connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        row = None
+        try:
+            for _ in range(5):
+                try:
+                    with connection.transaction():
+                        row = work(connection.cursor())
+                    break
+                except CalendarChangedError:
+                    continue
+            if row is None:  # pragma: no cover - defensive
+                raise CalendarChangedError(
+                    f"calendar of point {point_id} kept changing while booking"
+                )
+        finally:
+            connection.isolation_level = previous_level
+    return _appointment_out(row)
+
+
+@app.post(
+    "/points/{point_id}/appointments/{appointment_id}/cancel",
+    response_model=AppointmentOut,
+    tags=["appointments"],
+)
+def cancel_appointment(
+    point_id: int, appointment_id: int, body: AppointmentCancelIn
+) -> AppointmentOut:
+    with db.conn() as connection:
+        with connection.transaction():
+            row = db.cancel_appointment(
+                connection.cursor(), point_id, appointment_id, body.cancel_token
+            )
+    return _appointment_out(row)

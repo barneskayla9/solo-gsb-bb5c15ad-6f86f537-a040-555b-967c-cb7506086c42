@@ -13,6 +13,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
@@ -37,6 +38,10 @@ def show(title: str, status: int, payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def main() -> None:
     status, point = call(
         "POST",
@@ -52,15 +57,14 @@ def main() -> None:
         {
             "expected_version": 0,
             "rules": {
+                # Open every day 00:00-23:00 local (UTC here): convenient for
+                # appointment demos; closed_dates and makeup work the same.
                 "weekly": [
-                    {"weekday": 1, "start_time": "09:00", "end_time": "17:00"},
-                    {"weekday": 3, "start_time": "09:00", "end_time": "17:00"},
-                    {"weekday": 5, "start_time": "20:00", "end_time": "02:00"},
+                    {"weekday": d, "start_time": "00:00", "end_time": "23:00"}
+                    for d in range(1, 8)
                 ],
-                "closed_dates": ["2026-10-01"],
-                "makeup": [
-                    {"day": "2026-10-01", "start_time": "13:00", "end_time": "16:00"}
-                ],
+                "closed_dates": [],
+                "makeup": [],
             },
         },
     )
@@ -94,6 +98,68 @@ def main() -> None:
                     f"  {day['local_date']}  {interval['start']} -> {interval['end']}"
                     f"  [{sources}]"
                 )
+
+    # ------------------------------------------------------------------
+    # Visit appointments
+    # ------------------------------------------------------------------
+    # A 30-minute slot two days from now at 12:00 UTC is inside the daily
+    # 00:00-23:00 opening.
+    start = (datetime.now(timezone.utc) + timedelta(days=2)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    end = start + timedelta(minutes=30)
+    booking_body = {
+        "start_at": utc(start),
+        "end_at": utc(end),
+        "idempotency_key": "demo-visit-0001",
+    }
+
+    status, booked = call("POST", f"/points/{pid}/appointments", booking_body)
+    show("book a visit (appointment no + cancel credential)", status, booked)
+
+    # Same key, same body -> the original result is returned unchanged.
+    status, replay = call("POST", f"/points/{pid}/appointments", booking_body)
+    show("retry with the same key/body -> original result", status, replay)
+
+    # Same key, different time range -> explicit conflict.
+    changed = dict(booking_body, start_at=utc(start + timedelta(hours=1)),
+                   end_at=utc(end + timedelta(hours=1)))
+    status, key_conflict = call("POST", f"/points/{pid}/appointments", changed)
+    show("same key, different content -> 409", status, key_conflict)
+
+    # Another visit touching the first one (end == next start) coexists.
+    touching = {
+        "start_at": utc(end),
+        "end_at": utc(end + timedelta(minutes=30)),
+        "idempotency_key": "demo-visit-0002",
+    }
+    status, second = call("POST", f"/points/{pid}/appointments", touching)
+    show("back-to-back visit (touching is allowed)", status, second)
+
+    # A true overlap is rejected.
+    overlap = {
+        "start_at": utc(start + timedelta(minutes=10)),
+        "end_at": utc(end + timedelta(minutes=10)),
+        "idempotency_key": "demo-visit-0003",
+    }
+    status, overlap_err = call("POST", f"/points/{pid}/appointments", overlap)
+    show("overlapping visit -> 409", status, overlap_err)
+
+    # Cancel with the credential; repeating it returns the cancelled state.
+    if booked.get("id"):
+        cancel_path = f"/points/{pid}/appointments/{booked['id']}/cancel"
+        status, cancelled = call(
+            "POST", cancel_path, {"cancel_token": booked["cancel_token"]}
+        )
+        show("cancel with credential", status, cancelled)
+        status, again = call(
+            "POST", cancel_path, {"cancel_token": booked["cancel_token"]}
+        )
+        show("repeat cancel -> still cancelled (idempotent)", status, again)
+        status, bad_token = call(
+            "POST", cancel_path, {"cancel_token": "wrong"}
+        )
+        show("cancel with wrong credential -> 403", status, bad_token)
 
 
 if __name__ == "__main__":

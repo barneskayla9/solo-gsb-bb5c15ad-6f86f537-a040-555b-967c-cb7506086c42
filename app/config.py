@@ -12,6 +12,8 @@ class Settings:
     host: str
     port: int
     max_query_days: int
+    booking_max_lead_days: int
+    booking_max_duration_hours: int
 
     @staticmethod
     def load() -> "Settings":
@@ -28,6 +30,10 @@ class Settings:
             host=os.getenv("APP_HOST", "0.0.0.0"),
             port=int(os.getenv("APP_PORT", "8000")),
             max_query_days=int(os.getenv("MAX_QUERY_DAYS", "370")),
+            booking_max_lead_days=int(os.getenv("BOOKING_MAX_LEAD_DAYS", "30")),
+            booking_max_duration_hours=int(
+                os.getenv("BOOKING_MAX_DURATION_HOURS", "2")
+            ),
         )
 
 

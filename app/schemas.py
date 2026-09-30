@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from .errors import InvalidPeriodError, UnknownTimezoneError
 from .scheduler import get_zone
@@ -58,6 +58,27 @@ class PointCreateIn(BaseModel):
 class PointUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     timezone: str | None = None
+
+
+class AppointmentCreateIn(BaseModel):
+    """Book a visit. Both instants must be explicit, timezone-aware UTC times."""
+
+    start_at: datetime
+    end_at: datetime
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _must_be_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            # A bare timestamp is ambiguous about the instant; refuse it with
+            # the normal request-shape error instead of guessing.
+            raise ValueError("timestamps must carry an explicit UTC offset, e.g. 'Z'")
+        return value.astimezone(timezone.utc)
+
+
+class AppointmentCancelIn(BaseModel):
+    cancel_token: str = Field(min_length=1, max_length=200)
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +224,20 @@ class VersionOut(BaseModel):
     version: int
     published_at: datetime
     rules: dict
+
+
+class AppointmentOut(BaseModel):
+    id: int
+    point_id: int
+    start_at: str
+    end_at: str
+    idempotency_key: str
+    cancel_token: str
+    status: str
+    rules_version: int
+    created_at: datetime
+    cancelled_at: datetime | None = None
+
+    @field_serializer("created_at", "cancelled_at")
+    def _serialize_dt(self, value: datetime | None) -> str | None:
+        return None if value is None else utc_iso(value)
