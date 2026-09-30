@@ -11,6 +11,7 @@ from app.scheduler import (
     UnknownTimezone,
     WeeklyRule,
     build_calendar,
+    build_open_intervals,
     get_zone,
     resolve_end,
     resolve_start,
@@ -355,3 +356,68 @@ def test_source_dict_shapes():
 
 # Silence the unused-import helper lint for ZoneInfo in some runners.
 _ = ZoneInfo
+
+
+# ---------------------------------------------------------------------------
+# Continuous open intervals (reservation containment)
+# ---------------------------------------------------------------------------
+
+def test_open_intervals_overnight_session_is_one_continuous_span():
+    rules = RuleSet(
+        weekly=(WeeklyRule(5, T(20), T(2)),),  # Friday 20:00 -> Saturday 02:00
+        closed_dates=frozenset(),
+        makeup=(),
+    )
+    intervals = build_open_intervals(
+        "UTC", rules, date(2026, 10, 2), date(2026, 10, 3)
+    )
+    # 2026-10-02 is a Friday; the session is a single span across midnight.
+    assert intervals == [(utc(2026, 10, 2, 20), utc(2026, 10, 3, 2))]
+
+
+def test_open_intervals_closure_on_first_day_removes_whole_session():
+    rules = RuleSet(
+        weekly=(WeeklyRule(5, T(20), T(2)),),
+        closed_dates=frozenset({date(2026, 10, 2)}),
+        makeup=(),
+    )
+    assert build_open_intervals("UTC", rules, date(2026, 10, 2), date(2026, 10, 3)) == []
+
+
+def test_open_intervals_closure_on_second_day_keeps_first_day_upto_midnight():
+    rules = RuleSet(
+        weekly=(WeeklyRule(5, T(20), T(2)),),
+        closed_dates=frozenset({date(2026, 10, 3)}),
+        makeup=(),
+    )
+    intervals = build_open_intervals(
+        "UTC", rules, date(2026, 10, 2), date(2026, 10, 3)
+    )
+    assert intervals == [(utc(2026, 10, 2, 20), utc(2026, 10, 3, 0))]
+
+
+def test_open_intervals_touching_sessions_merge_across_sources():
+    rules = RuleSet(
+        weekly=(WeeklyRule(3, T(8), T(12)),),
+        closed_dates=frozenset(),
+        makeup=(MakeupRule(date(2026, 10, 7), T(12), T(14)),),
+    )
+    intervals = build_open_intervals(
+        "UTC", rules, date(2026, 10, 7), date(2026, 10, 7)
+    )
+    assert intervals == [(utc(2026, 10, 7, 8), utc(2026, 10, 7, 14))]
+
+
+def test_open_intervals_separate_sessions_stay_separate():
+    rules = RuleSet(
+        weekly=(WeeklyRule(3, T(8), T(10)), WeeklyRule(3, T(12), T(14))),
+        closed_dates=frozenset(),
+        makeup=(),
+    )
+    intervals = build_open_intervals(
+        "UTC", rules, date(2026, 10, 7), date(2026, 10, 7)
+    )
+    assert intervals == [
+        (utc(2026, 10, 7, 8), utc(2026, 10, 7, 10)),
+        (utc(2026, 10, 7, 12), utc(2026, 10, 7, 14)),
+    ]

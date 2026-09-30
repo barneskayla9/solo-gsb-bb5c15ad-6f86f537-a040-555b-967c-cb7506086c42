@@ -188,24 +188,18 @@ def _merge_pieces(
     return [(s, e, tuple(srcs)) for s, e, srcs in merged]
 
 
-def build_calendar(
-    tz_name: str,
+def _collect_day_pieces(
     rules: RuleSet,
-    date_from: date,
+    zone: ZoneInfo,
+    seed: date,
     date_to: date,
-) -> list[DayResult]:
-    """Expand the inclusive local-date range ``[date_from, date_to]``.
+) -> dict[date, list[tuple[datetime, datetime, Source, date]]]:
+    """Generate the located-day pieces for every day in ``[seed, date_to]``.
 
-    Returns one :class:`DayResult` per local date, in ascending order.  Every
-    interval is clipped to that local day and expressed in UTC.
+    Weekly sessions starting on ``date_to`` may locate a tail piece on
+    ``date_to + 1``.  Closures and makeup openings are applied here, so the
+    returned pieces are the definitive open fragments.
     """
-    if date_to < date_from:
-        raise ValueError("date_to must be on or after date_from")
-    zone = get_zone(tz_name)
-
-    # Weekly rules matching on the previous evening may spill into date_from,
-    # so the seed day is one day earlier.  Nothing spills more than one day.
-    seed = date_from - timedelta(days=1)
     by_weekday: dict[int, list[WeeklyRule]] = {}
     for rule in rules.weekly:
         by_weekday.setdefault(rule.weekday, []).append(rule)
@@ -298,9 +292,55 @@ def build_calendar(
                 source, makeup.day,
             )
 
+    return day_pieces
+
+
+def build_calendar(
+    tz_name: str,
+    rules: RuleSet,
+    date_from: date,
+    date_to: date,
+) -> list[DayResult]:
+    """Expand the inclusive local-date range ``[date_from, date_to]``.
+
+    Returns one :class:`DayResult` per local date, in ascending order.  Every
+    interval is clipped to that local day and expressed in UTC.
+    """
+    if date_to < date_from:
+        raise ValueError("date_to must be on or after date_from")
+    zone = get_zone(tz_name)
+
+    # Weekly rules matching on the previous evening may spill into date_from,
+    # so the seed day is one day earlier.  Nothing spills more than one day.
+    seed = date_from - timedelta(days=1)
+    day_pieces = _collect_day_pieces(rules, zone, seed, date_to)
+
     results: list[DayResult] = []
     day = date_from
     while day <= date_to:
         results.append(DayResult(day, _merge_pieces(day_pieces.get(day, []))))
         day += timedelta(days=1)
     return results
+
+
+def build_open_intervals(
+    tz_name: str,
+    rules: RuleSet,
+    date_from: date,
+    date_to: date,
+) -> list[tuple[datetime, datetime]]:
+    """Merged *continuous* open intervals (UTC) over the local-date range.
+
+    Unlike :func:`build_calendar`, intervals are not clipped at local
+    midnights: pieces that touch across a day seam merge into one continuous
+    interval, so an overnight weekly session appears as a single span.  A
+    reservation is "fully open" exactly when it fits inside one of these
+    intervals.  Sessions spilling one day past either range edge are included.
+    """
+    if date_to < date_from:
+        raise ValueError("date_to must be on or after date_from")
+    zone = get_zone(tz_name)
+    seed = date_from - timedelta(days=1)
+    day_pieces = _collect_day_pieces(rules, zone, seed, date_to)
+    all_pieces = [piece for pieces in day_pieces.values() for piece in pieces]
+    return [(start, end) for start, end, _sources in _merge_pieces(all_pieces)]

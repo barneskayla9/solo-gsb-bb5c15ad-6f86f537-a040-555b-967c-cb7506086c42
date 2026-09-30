@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .errors import InvalidPeriodError, UnknownTimezoneError
 from .scheduler import get_zone
@@ -58,6 +58,26 @@ class PointCreateIn(BaseModel):
 class PointUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     timezone: str | None = None
+
+
+class ReservationCreateIn(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
+class ReservationCancelIn(BaseModel):
+    cancel_token: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +170,50 @@ def validate_rules_payload(payload: RulesPayloadIn) -> dict:
     }
 
 
+def validate_reservation_window(
+    start: datetime,
+    end: datetime,
+    now: datetime,
+    *,
+    max_days_ahead: int,
+    max_duration: timedelta,
+) -> None:
+    """Validate a reservation window against the booking policy.
+
+    All failures raise :class:`InvalidPeriodError` so clients get the same
+    distinguishable ``invalid_period`` code as the rule endpoints.
+    """
+    if end <= start:
+        raise InvalidPeriodError(
+            "reservation end must be strictly after its start",
+            details={"start": utc_iso(start), "end": utc_iso(end)},
+        )
+    duration = end - start
+    if duration > max_duration:
+        raise InvalidPeriodError(
+            f"reservation lasts {duration}; maximum allowed is {max_duration}",
+            details={
+                "max_duration_minutes": int(max_duration.total_seconds() // 60),
+                "duration_minutes": duration.total_seconds() / 60,
+            },
+        )
+    if start < now:
+        raise InvalidPeriodError(
+            "reservation start must be in the future",
+            details={"start": utc_iso(start), "now": utc_iso(now)},
+        )
+    horizon = now + timedelta(days=max_days_ahead)
+    if start > horizon:
+        raise InvalidPeriodError(
+            f"reservation start must be within the next {max_days_ahead} days",
+            details={
+                "start": utc_iso(start),
+                "latest_allowed": utc_iso(horizon),
+                "max_days_ahead": max_days_ahead,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -203,3 +267,30 @@ class VersionOut(BaseModel):
     version: int
     published_at: datetime
     rules: dict
+
+
+class ReservationOut(BaseModel):
+    """Returned on creation and on same-content idempotent replays."""
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    cancel_token: str
+    created_at: datetime
+    cancelled_at: datetime | None
+
+
+class ReservationStateOut(BaseModel):
+    """Public state of a reservation (no cancel token)."""
+
+    id: int
+    point_id: int
+    status: str
+    start: str
+    end: str
+    rules_version: int
+    created_at: datetime
+    cancelled_at: datetime | None

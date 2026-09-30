@@ -64,3 +64,98 @@ echo "-- no published rules (create another point) --"
 EMPTY="$(api POST /points '{"name":"未配置点","timezone":"UTC"}')"
 EPID="$(echo "$EMPTY" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
 api GET "/points/$EPID/calendar?from=2026-09-28&to=2026-10-04"
+
+echo
+echo "== 7. Reservations (booked against the published calendar) =="
+# Reservations must start within the next 30 days, so compute the window
+# dynamically: tomorrow (UTC), with a weekly rule covering its weekday.
+D1="$(date -u -d '+1 day' +%F 2>/dev/null || date -u -v+1d +%F)"
+WD="$(date -u -d "$D1" +%u 2>/dev/null || date -u -j -f '%F' "$D1" +%u)"
+
+echo "-- create a UTC point and publish a rule covering tomorrow ($D1, weekday $WD) --"
+RPOINT_JSON="$(api POST /points '{"name":"预约演示点","timezone":"UTC"}')"
+echo "$RPOINT_JSON"
+RPID="$(echo "$RPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$RPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- book 09:00-10:00 UTC tomorrow (201) --"
+RES_JSON="$(api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}")"
+echo "$RES_JSON"
+RID="$(echo "$RES_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+TOKEN="$(echo "$RES_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- same key + same content replays the original result (200) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}"
+
+echo
+echo "-- same key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-1\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}"
+
+echo
+echo "-- overlapping window rejected (409 reservation_overlap) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-2\",
+  \"start\": \"${D1}T09:30:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}"
+
+echo
+echo "-- touching window 10:00-11:00 is fine (201) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-3\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}"
+
+echo
+echo "-- outside open hours (409 outside_open_hours) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-4\",
+  \"start\": \"${D1}T13:00:00Z\",
+  \"end\": \"${D1}T14:00:00Z\"
+}"
+
+echo
+echo "-- publishing rules that un-cover active reservations is refused (409) --"
+api POST "/points/$RPID/rules" '{
+  "expected_version": 1,
+  "rules": {"weekly": [], "closed_dates": [], "makeup": []}
+}'
+
+echo
+echo "-- cancel with a wrong token (403 invalid_cancel_token) --"
+api POST "/points/$RPID/reservations/$RID/cancel" '{"cancel_token":"wrong"}'
+
+echo
+echo "-- cancel with the issued token (200), then repeat cancel stays cancelled --"
+api POST "/points/$RPID/reservations/$RID/cancel" "{\"cancel_token\":\"$TOKEN\"}"
+api POST "/points/$RPID/reservations/$RID/cancel" "{\"cancel_token\":\"$TOKEN\"}"
+
+echo
+echo "-- the freed window can be booked again (201) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-5\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}"

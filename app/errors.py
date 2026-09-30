@@ -46,3 +46,45 @@ class InvalidPeriodError(ApiError):
 class UnknownTimezoneError(ApiError):
     status_code = 422
     code = "unknown_timezone"
+
+
+# ---------------------------------------------------------------------------
+# Reservations
+# ---------------------------------------------------------------------------
+
+class ReservationNotFoundError(ApiError):
+    status_code = 404
+    code = "reservation_not_found"
+
+
+class InvalidCancelTokenError(ApiError):
+    status_code = 403
+    code = "invalid_cancel_token"
+
+
+class IdempotencyConflictError(ApiError):
+    """Same point + idempotency key but a different request payload."""
+
+    status_code = 409
+    code = "idempotency_conflict"
+
+
+class ReservationOverlapError(ApiError):
+    """The requested window overlaps another active reservation."""
+
+    status_code = 409
+    code = "reservation_overlap"
+
+
+class OutsideOpenHoursError(ApiError):
+    """The requested window is not fully inside one continuous open interval."""
+
+    status_code = 409
+    code = "outside_open_hours"
+
+
+class ReservationChangeConflictError(ApiError):
+    """A rule publish / timezone change would un-cover active reservations."""
+
+    status_code = 409
+    code = "reservation_change_conflict"

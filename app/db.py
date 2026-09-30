@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import secrets
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import TracebackType
 
@@ -12,12 +13,21 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .errors import (
+    InvalidCancelTokenError,
     NotFoundError,
     NoPublishedVersionError,
+    ReservationChangeConflictError,
+    ReservationNotFoundError,
     VersionConflictError,
     VersionNotFoundError,
 )
-from .scheduler import MakeupRule, RuleSet, WeeklyRule
+from .scheduler import (
+    MakeupRule,
+    RuleSet,
+    WeeklyRule,
+    build_open_intervals,
+    get_zone,
+)
 
 _SCHEMA_SQL = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
 
@@ -139,6 +149,23 @@ def get_point(cur: psycopg.Cursor, point_id: int) -> dict:
     return row
 
 
+def lock_point(cur: psycopg.Cursor, point_id: int) -> dict:
+    """Lock the point row (FOR UPDATE) and return it, or 404.
+
+    Every mutation that can affect reservations (reservation creation, rule
+    publication, timezone change) takes this lock first, so they serialize
+    per point and each sees the other's committed results.
+    """
+    row = cur.execute(
+        "SELECT id, name, timezone, version, created_at, updated_at "
+        "FROM points WHERE id = %s FOR UPDATE",
+        (point_id,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"recycling point {point_id} does not exist")
+    return row
+
+
 def update_point(cur: psycopg.Cursor, point_id: int, **fields) -> dict:
     assignments = [f"{key} = %s" for key in fields]
     assignments.append("updated_at = now()")
@@ -164,10 +191,12 @@ def publish_rules(
 
     The point row is locked first so concurrent publish attempts for the same
     point serialize; a stale ``expected_version`` aborts the whole
-    transaction with a 409 and reports the current version.
+    transaction with a 409 and reports the current version.  Publishing is
+    also refused when it would leave a not-yet-finished active reservation
+    no longer fully open.
     """
     point = cur.execute(
-        "SELECT id, version FROM points WHERE id = %s FOR UPDATE",
+        "SELECT id, version, timezone FROM points WHERE id = %s FOR UPDATE",
         (point_id,),
     ).fetchone()
     if point is None:
@@ -179,6 +208,7 @@ def publish_rules(
             f"version {current}",
             details={"expected_version": expected_version, "current_version": current},
         )
+    assert_reservations_fit(cur, point_id, point["timezone"], payload)
 
     next_version = current + 1
     cur.execute(
@@ -252,3 +282,137 @@ def get_pinned_rules(
             details={"point_id": point_id, "requested_version": version},
         )
     return point, row
+
+
+def get_latest_payload(cur: psycopg.Cursor, point_id: int) -> dict | None:
+    """Return the newest published ``{version, payload}`` row, if any."""
+    return cur.execute(
+        "SELECT version, payload FROM rule_versions "
+        "WHERE point_id = %s ORDER BY version DESC LIMIT 1",
+        (point_id,),
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Reservations
+# ---------------------------------------------------------------------------
+
+_RESERVATION_COLS = (
+    "id, point_id, idempotency_key, start_utc, end_utc, rules_version, "
+    "cancel_token, status, created_at, cancelled_at"
+)
+
+
+def get_reservation_by_key(
+    cur: psycopg.Cursor, point_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations "
+        "WHERE point_id = %s AND idempotency_key = %s",
+        (point_id, idempotency_key),
+    ).fetchone()
+
+
+def insert_reservation(
+    cur: psycopg.Cursor,
+    point_id: int,
+    idempotency_key: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    return cur.execute(
+        f"INSERT INTO reservations "
+        f"(point_id, idempotency_key, start_utc, end_utc, rules_version, "
+        f" cancel_token) "
+        f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_RESERVATION_COLS}",
+        (
+            point_id,
+            idempotency_key,
+            start_utc,
+            end_utc,
+            rules_version,
+            secrets.token_urlsafe(32),
+        ),
+    ).fetchone()
+
+
+def find_overlapping(
+    cur: psycopg.Cursor, point_id: int, start_utc: datetime, end_utc: datetime
+) -> list[dict]:
+    """Active reservations overlapping ``[start_utc, end_utc)``.
+
+    Strict inequality on both sides means reservations that merely touch
+    (one ends exactly when the other starts) coexist peacefully.
+    """
+    return cur.execute(
+        "SELECT id, start_utc, end_utc FROM reservations "
+        "WHERE point_id = %s AND status = 'active' "
+        "AND start_utc < %s AND end_utc > %s ORDER BY id",
+        (point_id, end_utc, start_utc),
+    ).fetchall()
+
+
+def cancel_reservation(
+    cur: psycopg.Cursor, point_id: int, reservation_id: int, cancel_token: str | None
+) -> dict:
+    """Cancel one reservation; idempotent on repeat calls with the token."""
+    row = cur.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations "
+        "WHERE id = %s AND point_id = %s FOR UPDATE",
+        (reservation_id, point_id),
+    ).fetchone()
+    if row is None:
+        raise ReservationNotFoundError(
+            f"reservation {reservation_id} of point {point_id} does not exist",
+            details={"point_id": point_id, "reservation_id": reservation_id},
+        )
+    if cancel_token is None:
+        raise InvalidCancelTokenError("cancel_token is required")
+    if not secrets.compare_digest(row["cancel_token"], cancel_token):
+        raise InvalidCancelTokenError("cancel_token does not match")
+    if row["status"] == "cancelled":
+        return row
+    return cur.execute(
+        f"UPDATE reservations SET status = 'cancelled', cancelled_at = now() "
+        f"WHERE id = %s RETURNING {_RESERVATION_COLS}",
+        (reservation_id,),
+    ).fetchone()
+
+
+def assert_reservations_fit(
+    cur: psycopg.Cursor, point_id: int, timezone_name: str, payload: dict
+) -> None:
+    """Refuse a rule/timezone change that un-covers active reservations.
+
+    Every not-yet-finished, non-cancelled reservation must remain fully
+    inside one continuous open interval of the calendar produced by
+    ``payload`` interpreted in ``timezone_name``.  Callers hold the point
+    row lock, so this check is race-free against concurrent reservations.
+    """
+    now = datetime.now(timezone.utc)
+    rows = cur.execute(
+        "SELECT id, start_utc, end_utc FROM reservations "
+        "WHERE point_id = %s AND status = 'active' AND end_utc > %s ORDER BY id",
+        (point_id, now),
+    ).fetchall()
+    if not rows:
+        return
+    zone = get_zone(timezone_name)
+    ruleset = payload_to_ruleset(payload)
+    date_from = min(r["start_utc"] for r in rows).astimezone(zone).date()
+    date_to = max(r["end_utc"] for r in rows).astimezone(zone).date()
+    intervals = build_open_intervals(
+        timezone_name, ruleset, date_from - timedelta(days=1), date_to + timedelta(days=1)
+    )
+    violating = [
+        r["id"]
+        for r in rows
+        if not any(s <= r["start_utc"] and r["end_utc"] <= e for s, e in intervals)
+    ]
+    if violating:
+        raise ReservationChangeConflictError(
+            f"{len(violating)} active reservation(s) of point {point_id} would "
+            f"no longer be fully open under the proposed change",
+            details={"conflicting_reservation_ids": violating},
+        )

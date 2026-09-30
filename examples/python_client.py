@@ -13,6 +13,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
@@ -94,6 +95,94 @@ def main() -> None:
                     f"  {day['local_date']}  {interval['start']} -> {interval['end']}"
                     f"  [{sources}]"
                 )
+
+    # ------------------------------------------------------------------
+    # Reservations: booked against the currently published calendar.
+    # The window must start within the next 30 days, so compute it from now.
+    # ------------------------------------------------------------------
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+    weekday = tomorrow.isoweekday()
+
+    status, utc_point = call(
+        "POST", "/points", {"name": "预约演示点", "timezone": "UTC"}
+    )
+    show("create a UTC point for reservations", status, utc_point)
+    rpid = utc_point["id"]
+
+    status, published = call(
+        "POST",
+        f"/points/{rpid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "12:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+    show(f"publish weekly rule for weekday {weekday}", status, published)
+
+    window = {
+        "idempotency_key": "visit-demo-1",
+        "start": f"{tomorrow}T09:00:00Z",
+        "end": f"{tomorrow}T10:00:00Z",
+    }
+    status, reservation = call("POST", f"/points/{rpid}/reservations", window)
+    show("book 09:00-10:00 UTC tomorrow", status, reservation)
+    rid = reservation["id"]
+    token = reservation["cancel_token"]
+
+    status, replay = call("POST", f"/points/{rpid}/reservations", window)
+    show("same key + same content replays (200)", status, replay)
+
+    status, conflict = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-1",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T11:00:00Z",
+        },
+    )
+    show("same key + different content conflicts", status, conflict)
+
+    status, overlap = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-2",
+            "start": f"{tomorrow}T09:30:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("overlapping window rejected", status, overlap)
+
+    status, blocked = call(
+        "POST",
+        f"/points/{rpid}/rules",
+        {
+            "expected_version": 1,
+            "rules": {"weekly": [], "closed_dates": [], "makeup": []},
+        },
+    )
+    show("publish that un-covers the reservation is refused", status, blocked)
+
+    status, cancelled = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/cancel",
+        {"cancel_token": token},
+    )
+    show("cancel with the issued token", status, cancelled)
+
+    status, again = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/cancel",
+        {"cancel_token": token},
+    )
+    show("repeat cancel returns the cancelled state", status, again)
 
 
 if __name__ == "__main__":

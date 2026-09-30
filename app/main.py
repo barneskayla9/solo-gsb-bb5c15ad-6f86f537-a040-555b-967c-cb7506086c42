@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import psycopg
@@ -13,7 +14,12 @@ import psycopg
 from . import db
 from .config import settings
 from .errors import ApiError
-from .errors import InvalidPeriodError
+from .errors import (
+    IdempotencyConflictError,
+    InvalidPeriodError,
+    OutsideOpenHoursError,
+    ReservationOverlapError,
+)
 from .schemas import (
     CalendarOut,
     DayOut,
@@ -23,13 +29,18 @@ from .schemas import (
     PointUpdateIn,
     PublishOut,
     PublishRulesIn,
+    ReservationCancelIn,
+    ReservationCreateIn,
+    ReservationOut,
+    ReservationStateOut,
     VersionOut,
     VersionSummaryOut,
     utc_iso,
+    validate_reservation_window,
     validate_rules_payload,
     validate_timezone,
 )
-from .scheduler import build_calendar
+from .scheduler import build_calendar, build_open_intervals, get_zone
 from .db import payload_to_ruleset
 
 
@@ -73,7 +84,13 @@ async def validation_error_handler(
             "error": {
                 "code": "invalid_request",
                 "message": "request payload failed validation",
-                "details": {"errors": exc.errors()},
+                # Validator exceptions live in the error context; render them
+                # as text so the envelope is always JSON-serializable.
+                "details": {
+                    "errors": jsonable_encoder(
+                        exc.errors(), custom_encoder={Exception: str}
+                    )
+                },
             }
         },
     )
@@ -115,7 +132,19 @@ def patch_point(point_id: int, body: PointUpdateIn) -> PointOut:
         validate_timezone(fields["timezone"])
     with db.conn() as connection:
         with connection.transaction():
-            row = db.update_point(connection.cursor(), point_id, **fields)
+            cur = connection.cursor()
+            if "timezone" in fields:
+                # A timezone change re-interprets every wall-clock rule; it is
+                # refused when it would un-cover an active reservation.  The
+                # point row lock serializes this check against concurrent
+                # reservation creations.
+                db.lock_point(cur, point_id)
+                latest = db.get_latest_payload(cur, point_id)
+                if latest is not None:
+                    db.assert_reservations_fit(
+                        cur, point_id, fields["timezone"], latest["payload"]
+                    )
+            row = db.update_point(cur, point_id, **fields)
     return PointOut(**row)
 
 
@@ -250,3 +279,141 @@ def calendar(
             for d in days
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Reservations — booked against the currently published calendar
+# ---------------------------------------------------------------------------
+
+def _reservation_out(row: dict) -> ReservationOut:
+    return ReservationOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        cancel_token=row["cancel_token"],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+    )
+
+
+def _reservation_state_out(row: dict) -> ReservationStateOut:
+    return ReservationStateOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        start=utc_iso(row["start_utc"]),
+        end=utc_iso(row["end_utc"]),
+        rules_version=row["rules_version"],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+    )
+
+
+@app.post(
+    "/points/{point_id}/reservations",
+    response_model=ReservationOut,
+    status_code=201,
+    tags=["reservations"],
+)
+def create_reservation(
+    point_id: int, body: ReservationCreateIn, response: Response
+) -> ReservationOut:
+    start = body.start.astimezone(timezone.utc)
+    end = body.end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # The point row lock serializes creations against each other and
+            # against rule publishes / timezone changes for this point.
+            point = db.lock_point(cur, point_id)
+
+            # Idempotency: the first successful request wins.  A same-content
+            # retry replays its stored result (even if it has since been
+            # cancelled); different content under the same key conflicts.
+            existing = db.get_reservation_by_key(
+                cur, point_id, body.idempotency_key
+            )
+            if existing is not None:
+                if existing["start_utc"] == start and existing["end_utc"] == end:
+                    response.status_code = 200
+                    return _reservation_out(existing)
+                raise IdempotencyConflictError(
+                    f"idempotency key {body.idempotency_key!r} was already used "
+                    f"on point {point_id} with a different time window",
+                    details={
+                        "reservation_id": existing["id"],
+                        "start": utc_iso(existing["start_utc"]),
+                        "end": utc_iso(existing["end_utc"]),
+                    },
+                )
+
+            validate_reservation_window(
+                start,
+                end,
+                now,
+                max_days_ahead=settings.reservation_max_days_ahead,
+                max_duration=timedelta(
+                    minutes=settings.reservation_max_duration_minutes
+                ),
+            )
+
+            # The reservation must fit inside one continuous open interval of
+            # the currently published calendar (intervals may cross local
+            # midnight; they are not clipped per day here).
+            _, rules_row = db.get_current_rules(cur, point_id)
+            zone = get_zone(point["timezone"])
+            ruleset = payload_to_ruleset(rules_row["payload"])
+            date_from = (start - timedelta(days=1)).astimezone(zone).date()
+            date_to = (end + timedelta(days=1)).astimezone(zone).date()
+            intervals = build_open_intervals(
+                point["timezone"], ruleset, date_from, date_to
+            )
+            if not any(s <= start and end <= e for s, e in intervals):
+                raise OutsideOpenHoursError(
+                    "reservation is not fully contained in one continuous "
+                    "open interval of the published calendar",
+                    details={
+                        "start": utc_iso(start),
+                        "end": utc_iso(end),
+                        "rules_version": rules_row["version"],
+                    },
+                )
+
+            overlapping = db.find_overlapping(cur, point_id, start, end)
+            if overlapping:
+                raise ReservationOverlapError(
+                    "reservation overlaps an existing active reservation",
+                    details={
+                        "conflicting_reservation_ids": [r["id"] for r in overlapping]
+                    },
+                )
+
+            row = db.insert_reservation(
+                cur,
+                point_id,
+                body.idempotency_key,
+                start,
+                end,
+                rules_row["version"],
+            )
+    return _reservation_out(row)
+
+
+@app.post(
+    "/points/{point_id}/reservations/{reservation_id}/cancel",
+    response_model=ReservationStateOut,
+    tags=["reservations"],
+)
+def cancel_reservation(
+    point_id: int, reservation_id: int, body: ReservationCancelIn
+) -> ReservationStateOut:
+    with db.conn() as connection:
+        with connection.transaction():
+            row = db.cancel_reservation(
+                connection.cursor(), point_id, reservation_id, body.cancel_token
+            )
+    return _reservation_state_out(row)

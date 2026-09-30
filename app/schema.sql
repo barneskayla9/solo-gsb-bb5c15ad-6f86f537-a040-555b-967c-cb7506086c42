@@ -23,3 +23,23 @@ CREATE TABLE IF NOT EXISTS rule_versions (
 
 CREATE INDEX IF NOT EXISTS idx_rule_versions_point
     ON rule_versions (point_id, version DESC);
+
+-- Visit reservations.  (point_id, idempotency_key) is the client's idempotency
+-- scope: the first successful request wins, same-content retries replay it.
+CREATE TABLE IF NOT EXISTS reservations (
+    id              BIGSERIAL PRIMARY KEY,
+    point_id        BIGINT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    start_utc       TIMESTAMPTZ NOT NULL,
+    end_utc         TIMESTAMPTZ NOT NULL,
+    rules_version   INTEGER NOT NULL,        -- published version validated against
+    cancel_token    TEXT NOT NULL,           -- capability token for cancellation
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'cancelled')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ,
+    UNIQUE (point_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_point_active
+    ON reservations (point_id, start_utc) WHERE status = 'active';
